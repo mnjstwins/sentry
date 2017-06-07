@@ -81,8 +81,12 @@ class RedisQuota(Quota):
             ))
         return tuple(results)
 
-    def get_redis_key(self, key, timestamp, interval):
-        return '{}:{}:{}'.format(self.namespace, key, int(timestamp // interval))
+    def get_redis_key(self, key, timestamp, interval, shift):
+        return '{}:{}:{}'.format(
+            self.namespace,
+            key,
+            int((timestamp - shift) // interval),
+        )
 
     def is_rate_limited(self, project, key=None):
         timestamp = time()
@@ -98,15 +102,16 @@ class RedisQuota(Quota):
         if not quotas:
             return NotRateLimited()
 
-        def get_next_period_start(interval):
+        def get_next_period_start(interval, shift):
             """Return the timestamp when the next rate limit period begins for an interval."""
-            return ((timestamp // interval) + 1) * interval
+            return ((timestamp // interval) + 1) * interval - shift
 
         keys = []
         args = []
         for quota in quotas:
-            keys.append(self.get_redis_key(quota.key, timestamp, quota.window))
-            expiry = get_next_period_start(quota.window) + self.grace
+            shift = project.organization_id % quota.window
+            keys.append(self.get_redis_key(quota.key, timestamp, quota.window, shift))
+            expiry = get_next_period_start(quota.window, shift) + self.grace
             args.extend((quota.limit, int(expiry)))
 
         client = self.cluster.get_local_client_for_key(six.text_type(project.organization.pk))
@@ -119,7 +124,8 @@ class RedisQuota(Quota):
                     continue
                 if quota.enforce:
                     enforce = True
-                    delay = get_next_period_start(quota.window) - timestamp
+                    shift = project.organization_id % quota.window
+                    delay = get_next_period_start(quota.window, shift) - timestamp
                     if delay > worst_case[0]:
                         worst_case = (delay, quota.reason_code)
             if enforce:
