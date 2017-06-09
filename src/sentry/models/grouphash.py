@@ -25,10 +25,10 @@ class GroupHash(Model):
     hash = models.CharField(max_length=32)
     group = FlexibleForeignKey('sentry.Group', null=True)
     state = BoundedPositiveIntegerField(
-        choices=(
+        choices=[
             (State.ACTIVE, _('Active')),
             (State.MIGRATION_IN_PROGRESS, _('Migration in Progress')),
-        ),
+        ],
         default=State.ACTIVE,
     )
 
