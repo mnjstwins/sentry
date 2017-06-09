@@ -3,6 +3,7 @@ from __future__ import absolute_import
 import logging
 from collections import defaultdict
 
+from django.db import transaction
 from django.db.models import F
 
 from sentry.app import tsdb
@@ -470,6 +471,40 @@ def update_tag_value_counts(id_list):
         )
 
 
+def lock_hashes(project_id, source_id, fingerprints):
+    # XXX: This only really works with a transaction isolation level of
+    # REPEATABLE READ or higher, which we don't have any control over.
+    with transaction.atomic():
+        eligible_hashes = list(
+            GroupHash.objects.filter(
+                project_id=project_id,
+                group_id=source_id,
+                hash__in=fingerprints,
+                state=GroupHash.State.ACTIVE,
+            )
+        )
+
+        GroupHash.objects.filter(
+            id__in=[h.id for h in eligible_hashes],
+        ).update(state=GroupHash.State.MIGRATION_IN_PROGRESS)
+
+        # TODO: Warn if the number of objects affected doesn't equal the number
+        # of eligible inputs?
+
+    return set(h.hash for h in eligible_hashes)
+
+
+def unlock_hashes(project_id, fingerprints):
+    GroupHash.objects.filter(
+        project_id=project_id,
+        hash__in=fingerprints,
+        state=GroupHash.State.MIGRATION_IN_PROGRESS,
+    ).update(state=GroupHash.State.ACTIVE)
+
+    # TODO: Warn if the number of objects affected doesn't equal the number of
+    # eligible inputs?
+
+
 @instrumented_task(name='sentry.tasks.unmerge', queue='unmerge')
 def unmerge(project_id, source_id, destination_id, fingerprints, actor_id, cursor=None, batch_size=500, source_fields_reset=False):
     # XXX: If a ``GroupHash`` is unmerged *again* while this operation is
@@ -477,7 +512,7 @@ def unmerge(project_id, source_id, destination_id, fingerprints, actor_id, curso
     # hash may not be migrated to the new destination! We could solve this with
     # an exclusive lock on the ``GroupHash`` record (I think) as long as
     # nothing in the ``EventManager`` is going to try and preempt that. (I'm
-    # not 100% sure that's the case.)
+    # not 100% sure that's the case.) (TODO: VALIDATE THIS ASSUMPTION!)
 
     # XXX: The queryset chunking logic below is awfully similar to
     # ``RangeQuerySetWrapper``. Ideally that could be refactored to be able to
@@ -488,6 +523,7 @@ def unmerge(project_id, source_id, destination_id, fingerprints, actor_id, curso
     # denormalizations from the source group so that we can have a clean slate
     # for the new, repaired data.
     if cursor is None:
+        fingerprints = lock_hashes(project_id, source_id, fingerprints)
         truncate_denormalizations(source_id)
 
     caches = get_caches()
@@ -514,6 +550,9 @@ def unmerge(project_id, source_id, destination_id, fingerprints, actor_id, curso
     # If there are no more events to process, we're done with the migration.
     if not events:
         update_tag_value_counts([source_id, destination_id])
+        # TODO: Should we also move any hashes at this point that didn't have
+        # any associated events to the destination group?
+        unlock_hashes(project_id, fingerprints)
         return destination_id
 
     Event.objects.bind_nodes(events, 'data')
